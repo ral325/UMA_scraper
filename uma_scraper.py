@@ -50,9 +50,9 @@ DEFAULT_CACHE_DIR = Path("cache")
 DEFAULT_PLOT_DIR  = Path("plots")
 
 
-def _cache_path(cache_dir: Path, version: str, min_timestamp: int) -> Path:
-    key = f"{version}_{min_timestamp}"
-    return cache_dir / f"{key}.json"
+def _cache_path(cache_dir: Path, version: str) -> Path:
+    """One cache file per version — no timestamp in the key."""
+    return cache_dir / f"{version}.json"
 
 
 def _get_max_ts(records: list[dict], version: str) -> int:
@@ -62,29 +62,51 @@ def _get_max_ts(records: list[dict], version: str) -> int:
     return max(vals) if vals else 0
 
 
+def _get_min_ts(records: list[dict], version: str) -> int:
+    """Return the lowest requestTimestamp / assertionTimestamp in a record list."""
+    field = "assertionTimestamp" if version == "v3" else "requestTimestamp"
+    vals = [int(r[field]) for r in records if r.get(field)]
+    return min(vals) if vals else 0
+
+
 def load_cache(cache_dir: Path, version: str, min_timestamp: int) -> tuple[list[dict] | None, int]:
     """
     Return (records, max_ts) from the cache envelope, or (None, 0) on miss.
 
     Cache envelope format:
         {
-          "min_timestamp": <int>,   # original --since epoch
+          "query_min_ts":  <int>,   # earliest --since ever used to populate this cache
           "max_ts":        <int>,   # highest request/assertion timestamp seen
           "fetched_at":    <str>,   # ISO-8601 wall-clock of last write
-          "records":       [...]    # raw GraphQL dicts
+          "records":       [...]    # raw GraphQL dicts (all history, unfiltered)
         }
 
-    Old-format files (plain list) are treated as a cache miss so they are
-    transparently rebuilt in the new format on the next fetch.
+    The cache is keyed only by version (one file per version). The --since filter
+    is applied in-memory after loading, so different --since values share the same
+    cache and never duplicate data.
+
+    If the requested min_timestamp predates the cache's query_min_ts the cache
+    doesn't cover the full range — treat as a miss so the caller re-fetches.
     """
-    path = _cache_path(cache_dir, version, min_timestamp)
+    path = _cache_path(cache_dir, version)
     if not path.exists():
+        # Also look for old-format files ({version}_{timestamp}.json) to hint the user
+        old = sorted(cache_dir.glob(f"{version}_*.json"))
+        if old:
+            print(f"  ⚠ Found old-format cache(s) for {version}: {[p.name for p in old]}")
+            print(f"    These are no longer used. Delete them or run without --offline to rebuild.")
         return None, 0
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    # Reject old plain-list format
     if isinstance(data, list):
-        print(f"  ⚠ Old-format cache found at {path} — will rebuild")
+        print(f"  ⚠ Old-format cache at {path} — will rebuild")
+        return None, 0
+    query_min = data.get("query_min_ts", data.get("min_timestamp", 0))
+    if query_min > min_timestamp:
+        cached_since = datetime.fromtimestamp(query_min, tz=timezone.utc).strftime("%Y-%m-%d")
+        want_since   = datetime.fromtimestamp(min_timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
+        print(f"  ⚠ Cache covers from {cached_since} but --since {want_since} requests earlier data.")
+        print(f"    Run with --no-cache to re-fetch from {want_since}.")
         return None, 0
     records = data.get("records", [])
     max_ts  = data.get("max_ts", 0)
@@ -96,12 +118,21 @@ def load_cache(cache_dir: Path, version: str, min_timestamp: int) -> tuple[list[
 def save_cache(cache_dir: Path, version: str, min_timestamp: int, records: list[dict]):
     """Persist records to the cache directory using the envelope format."""
     cache_dir.mkdir(parents=True, exist_ok=True)
-    path = _cache_path(cache_dir, version, min_timestamp)
+    path = _cache_path(cache_dir, version)
+    # Preserve the earliest query_min_ts if the file already exists
+    existing_min = min_timestamp
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                old = json.load(f)
+            existing_min = min(min_timestamp, old.get("query_min_ts", min_timestamp))
+        except Exception:
+            pass
     envelope = {
-        "min_timestamp": min_timestamp,
-        "max_ts":        _get_max_ts(records, version),
-        "fetched_at":    datetime.now(tz=timezone.utc).isoformat(),
-        "records":       records,
+        "query_min_ts": existing_min,
+        "max_ts":       _get_max_ts(records, version),
+        "fetched_at":   datetime.now(tz=timezone.utc).isoformat(),
+        "records":      records,
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(envelope, f)
@@ -300,7 +331,6 @@ def fetch_all_v3(endpoint: str, min_timestamp: int) -> list[dict]:
         settlementPayout
         settlementRecipient
         expirationTime
-        settled
         settlementResolution
       }}
     }}
@@ -353,6 +383,7 @@ def normalise_v2(records: list[dict]) -> pd.DataFrame:
         proposer  = (r.get("proposer") or "").lower()
         disputer  = (r.get("disputer") or "").lower()
         recipient = (r.get("settlementRecipient") or "").lower()
+        ccy       = (r.get("currency") or "").lower()
 
         # Infer who won from settlement recipient address
         if not disputed or not recipient:
@@ -378,17 +409,24 @@ def normalise_v2(records: list[dict]) -> pd.DataFrame:
             "settlement_ts":    _ts(r.get("settlementTimestamp")),
             "proposed_price":   _wei(r.get("proposedPrice")),
             "settlement_price": _wei(r.get("settlementPrice")),
-            "settlement_payout":_wei(r.get("settlementPayout")),
-            "reward":           _wei(r.get("reward")),
-            "bond":             _wei(r.get("bond")),
-            "final_fee":        _wei(r.get("finalFee")),
+            "settlement_payout":_wei(r.get("settlementPayout"), ccy),
+            "reward":           _wei(r.get("reward"), ccy),
+            "bond":             _wei(r.get("bond"), ccy),
+            "final_fee":        _wei(r.get("finalFee"), ccy),
             "state":            state,
             "has_proposal":     proposer != "",
             "disputed":         disputed,
             "resolved":         state in ("Settled", "Expired"),
             "challenger_won":   challenger_won,
         })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # Explicitly cast monetary columns to float64 so pd.concat never sees
+    # ambiguous all-NA object columns (avoids FutureWarning in pandas 2.x).
+    for col in ("proposed_price", "settlement_price", "settlement_payout",
+                "reward", "bond", "final_fee"):
+        if col in df.columns:
+            df[col] = df[col].astype("float64")
+    return df
 
 
 def normalise_v3(records: list[dict]) -> pd.DataFrame:
@@ -396,18 +434,23 @@ def normalise_v3(records: list[dict]) -> pd.DataFrame:
     rows = []
     for r in records:
         disputed = r.get("disputer") is not None
+        ccy      = (r.get("currency") or "").lower()
         # OOv3 settlementResolution: "true" means assertion was upheld,
         # so challenger_won = True when resolution is "false"
         res = r.get("settlementResolution")
         if res is None or not disputed:
             challenger_won = None
+        elif isinstance(res, bool):
+            # Subgraph may return a native bool instead of string "true"/"false"
+            challenger_won = not res  # True = assertion upheld = proposer won
         else:
-            challenger_won = (res.lower() == "false")  # assertion rejected → challenger won
+            challenger_won = (str(res).lower() == "false")  # assertion rejected → challenger won
 
         rows.append({
             "id":                  r["id"],
             "version":             "v3",
             "identifier":          _decode_identifier(r.get("identifier", "")),
+            "ancillary_data":      "",
             "requester":           (r.get("callbackRecipient") or "").lower(),
             "proposer":            (r.get("asserter") or "").lower(),
             "disputer":            (r.get("disputer") or "").lower(),
@@ -416,15 +459,23 @@ def normalise_v3(records: list[dict]) -> pd.DataFrame:
             "dispute_ts":          _ts(r.get("disputeTimestamp")),
             "settlement_ts":       _ts(r.get("settlementTimestamp")),
             "proposed_price":      None,
-            "settlement_price":    _wei(r.get("settlementPayout")),
-            "reward":              _wei(r.get("bond")),
+            "settlement_price":    _wei(r.get("settlementPayout"), ccy),
+            "settlement_payout":   _wei(r.get("settlementPayout"), ccy),
+            "reward":              _wei(r.get("bond"), ccy),
+            "bond":                _wei(r.get("bond"), ccy),
             "final_fee":           None,
+            "state":               "",
             "has_proposal":        True,  # v3 asserter IS the proposer
             "disputed":            disputed,
-            "resolved":            r.get("settled", False),
+            "resolved":            r.get("settlementTimestamp") is not None,
             "challenger_won":      challenger_won,
         })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    for col in ("proposed_price", "settlement_price", "settlement_payout",
+                "reward", "bond", "final_fee"):
+        if col in df.columns:
+            df[col] = df[col].astype("float64")
+    return df
 
 
 def _ts(val) -> datetime | None:
@@ -436,12 +487,28 @@ def _ts(val) -> datetime | None:
         return None
 
 
-def _wei(val) -> float | None:
-    """Convert a raw integer string (18 decimals) to float. Returns None if absent."""
+# Known 6-decimal token addresses (lower-case). USDC and USDT are the most
+# common collateral on Polymarket / Polygon and use 6 decimals, not 18.
+_DECIMALS_6 = frozenset({
+    "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC  (Ethereum mainnet)
+    "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",  # USDC.e (Polygon PoS)
+    "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",  # native USDC (Polygon)
+    "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT  (Ethereum mainnet)
+    "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",  # USDT  (Polygon PoS)
+})
+
+
+def _wei(val, currency: str = "") -> float | None:
+    """Convert a raw integer string to a human-readable float.
+
+    Uses 6 decimals for known stablecoins (USDC, USDT), 18 for everything else.
+    Pass the token address via `currency` for correct conversion.
+    """
     if val is None:
         return None
     try:
-        return int(val) / 1e18
+        decimals = 6 if currency.lower() in _DECIMALS_6 else 18
+        return int(val) / (10 ** decimals)
     except Exception:
         return None
 
@@ -793,6 +860,8 @@ def parse_args():
     # Caching
     p.add_argument("--no-cache", action="store_true",
                    help="Ignore cached data and re-fetch from the subgraph")
+    p.add_argument("--offline", action="store_true",
+                   help="Use cached data only — skip all network calls (error if no cache)")
     p.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR),
                    help=f"Directory for cached raw data (default: {DEFAULT_CACHE_DIR})")
     p.add_argument("--recheck-days", type=int, default=30,
@@ -834,7 +903,15 @@ def main():
             if not args.no_cache:
                 cached_records, cached_max_ts = load_cache(cache_dir, ver, min_ts)
 
-            if cached_records is None:
+            ts_field = "assertionTimestamp" if ver == "v3" else "requestTimestamp"
+
+            if args.offline:
+                # Offline mode: use cache as-is, no network calls
+                if cached_records is None:
+                    print(f"  ✗ No cache found for {ver} — run without --offline to fetch first.")
+                    continue
+                raw = cached_records
+            elif cached_records is None:
                 # No cache — full fetch from --since date
                 if ver == "v3":
                     raw = fetch_all_v3(ep, min_ts)
@@ -862,7 +939,6 @@ def main():
                     before = len(merged)
                     for r in new_records:
                         merged[r["id"]] = r
-                    ts_field = "assertionTimestamp" if ver == "v3" else "requestTimestamp"
                     raw = sorted(merged.values(), key=lambda r: int(r.get(ts_field, 0)))
                     added = len(merged) - before
                     updated = len(new_records) - added
@@ -871,6 +947,10 @@ def main():
                 else:
                     print(f"  → Cache is up to date, no new records")
                     raw = cached_records
+
+            # Apply --since filter in memory. The cache stores all history; --since
+            # is just a view filter so different values share the same cache file.
+            raw = [r for r in raw if int(r.get(ts_field) or 0) >= min_ts]
 
             if ver == "v3":
                 df = normalise_v3(raw)
@@ -940,8 +1020,14 @@ def main():
 
     # ── High-stakes disputes ───────────────────────────────────────────────────
     print_section("HIGH-STAKES DISPUTES (top 10 by reward)")
-    # Sort by settlement_payout (actual value at stake), fall back to bond
-    payout_col = "settlement_payout" if "settlement_payout" in df.columns else "bond"
+    # Sort by settlement_payout (actual value at stake), fall back to bond or reward.
+    # Use > 0 (not just notna) because tokens with wrong decimal conversion show as ~0.
+    disputed_df = df[df["disputed"]]
+    payout_col = "bond"  # default
+    for col in ("settlement_payout", "bond", "reward"):
+        if col in df.columns and (disputed_df[col] > 0).any():
+            payout_col = col
+            break
     hot = (
         df[df["disputed"] & df[payout_col].notna()]
         .sort_values(payout_col, ascending=False)
