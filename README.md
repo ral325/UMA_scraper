@@ -30,20 +30,29 @@ breaks that down by:
 ```bash
 pip install -r requirements.txt
 
-# Full OOv2 history from 2022 onward
+# Full OOv2 history from 2022 onward (fetched once, cached locally)
 python uma_scraper.py --since 2022-01-01
 
-# Save raw data too
+# Same command again — loads from cache, fetches only new records
+python uma_scraper.py --since 2022-01-01
+
+# Generate PNG plots into ./plots/
+python uma_scraper.py --since 2022-01-01 --plots
+
+# Save normalised data to CSV as well
 python uma_scraper.py --since 2022-01-01 --csv disputes.csv
 
 # Only Polymarket's oracle requests (Polygon MOOV2)
 python uma_scraper.py --version moov2 --since 2023-01-01
 
 # Cross-chain comparison
-python uma_scraper.py --version all --since 2023-01-01 --csv all_chains.csv
+python uma_scraper.py --version all --since 2023-01-01
 
 # Specific requester address
 python uma_scraper.py --requester 0xd91e80cf2e7be2e162c6513ced06f1dd0da35296
+
+# Force a full re-fetch, ignoring the cache
+python uma_scraper.py --no-cache
 ```
 
 ---
@@ -70,6 +79,47 @@ All endpoints are public Goldsky-hosted subgraphs from UMA's own
 3. **Top requesters** — which contracts drive the most volume and disputes
 4. **Identifier breakdown** — dispute rates by question type
 5. **High-stakes disputes** — biggest rewards in disputed assertions
+
+---
+
+## Caching
+
+Raw subgraph data is cached locally in `./cache/` (gitignored) as JSON files keyed by `{version}_{since-timestamp}.json`.
+
+**On subsequent runs the script:**
+1. Loads the cached records instantly
+2. Fetches only records newer than the cache high-water mark
+3. Re-fetches the last **30 days** of records to pick up state changes on in-flight requests (e.g. `Proposed → Disputed → Settled`)
+4. Merges and saves back to the cache
+
+```bash
+# Widen the back-check window (empirical p95 for disputed records is ~118 days)
+python uma_scraper.py --recheck-days 120
+
+# Custom cache location
+python uma_scraper.py --cache-dir ./data
+
+# Bypass cache entirely
+python uma_scraper.py --no-cache
+```
+
+---
+
+## Plots
+
+Add `--plots` to generate five PNG charts saved to `./plots/` (gitignored):
+
+| File | What it shows |
+|---|---|
+| `funnel.png` | Horizontal bar: requests → proposed → disputed → resolved |
+| `dispute_outcomes.png` | Pie: challenger wins / proposer wins / unknown |
+| `monthly_trend.png` | Bars (volume) + line (dispute rate %) by month |
+| `challenger_win_rate.png` | Monthly challenger win rate with 50% reference line |
+| `top_requesters.png` | Stacked bar (disputed/undisputed) + dispute rate per requester |
+
+```bash
+python uma_scraper.py --plots --plot-dir ./figs
+```
 
 ---
 
